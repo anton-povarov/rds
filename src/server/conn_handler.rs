@@ -116,7 +116,7 @@ impl ConnectionHandler {
                 return Ok(ShouldDisconnect::Yes);
             }
 
-            "get" => {
+            "get" | "GET" => {
                 // request: get <key>\r\n
                 // response (ok): <key> <data_len>\r\n<data>\r\n
                 // response (err): NOT_FOUND\r\n
@@ -179,7 +179,7 @@ impl ConnectionHandler {
                 return Ok(ShouldDisconnect::No);
             }
 
-            "set" => {
+            "set" | "SET" => {
                 // set <key> <data_len>\r\n<data>\r\n
                 // response (ok): STORED\r\n
                 // response (err): ERROR: <helpful text>\r\n

@@ -553,7 +553,9 @@ dependencies = [
 
 [[package]]
 name = "libmdbx"
-version = "0.6.5"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1da773dcce45661428e2b51ca984eb3c64c08f2aa54865397e4b77d1f61c9f07"
 dependencies = [
  "bitflags",
  "derive_more",
@@ -598,7 +600,9 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "mdbx-sys"
-version = "13.10.0"
+version = "13.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4002b9ffed3dd01364ab005bca653a99b8f550ca4cd755470a9d3a31a44f466"
 dependencies = [
  "bindgen",
  "cc",

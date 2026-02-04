@@ -4,9 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libmdbx = { version = "0.6.5", features = [
-	"lifetimed-bytes",
-], path = "/Users/antoxa/_Dev/libmdbx-rs" }
+libmdbx = { version = "0.6.5", features = ["lifetimed-bytes"] }
 bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 memchr = "2.7.6"

@@ -111,7 +111,7 @@ impl DBSyncThread {
                             }
                         };
 
-                        let tx = db.db.begin_raw_rw_txn().expect("RW transaction start failed");
+                        let tx = db.db.begin_rw_txn().expect("RW transaction start failed");
                         let table = tx.open_table(None).unwrap();
 
                         for (k, v) in msg.data.into_iter() {

@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 use tokio::{
-    io::{self, AsyncReadExt, AsyncWriteExt},
+    io::{self, AsyncWriteExt},
     net::TcpStream,
     sync::Barrier,
     task::JoinSet,
@@ -76,6 +76,8 @@ struct SharedContext {
     args: Arc<Args>,
     barrier: tokio::sync::Barrier,
     all_keys: Vec<String>,
+
+    #[allow(unused)] // todo: implement hot keys
     hot_keys: Vec<String>,
 }
 
