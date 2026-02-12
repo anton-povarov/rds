@@ -25,22 +25,40 @@ struct Args {
     n_threads: u16,
 }
 
+fn pick_thread_split(total_threads: usize) -> (usize, u32) {
+    let total_threads = std::cmp::max(2, total_threads);
+    let mut db_workers = total_threads.saturating_div(3).clamp(1, 4);
+    if db_workers >= total_threads {
+        db_workers = total_threads - 1;
+    }
+
+    let io_threads = total_threads - db_workers;
+    (io_threads, db_workers as u32)
+}
+
 fn main() {
     let args = Args::parse();
+    let requested_total_threads = std::cmp::max(args.n_threads, 2);
+    let (io_threads, db_workers) = pick_thread_split(args.n_threads as usize);
+
+    println!(
+        "thread config: total={} (io_threads={} db_workers={}) (+1 db sync thread)",
+        requested_total_threads, io_threads, db_workers
+    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.n_threads.into())
+        .worker_threads(io_threads)
         .enable_all()
         .build()
         .unwrap();
 
-    match rt.block_on(async { server_main(&args).await }) {
+    match rt.block_on(async { server_main(&args, db_workers).await }) {
         Ok(_) => {}
         Err(e) => println!("Error: {}", e),
     }
 }
 
-async fn server_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn server_main(args: &Args, db_workers: u32) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let _shutdown_watch_task = tokio::spawn(async move {
         tokio::signal::ctrl_c().await.expect("failed to wait for Ctrl+C");
@@ -58,7 +76,7 @@ async fn server_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let db = LmdbxStorage::open(&args.db_path).map_err(|e| {
         return format!("lmdbx error: {}", e);
     })?;
-    let db_engine = DBEngine::startup(4, db);
+    let db_engine = DBEngine::startup(db_workers, db);
 
     loop {
         select! {
