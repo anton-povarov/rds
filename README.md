@@ -29,8 +29,7 @@ $ cargo run --bin client --release -- --port 9000 -k 200000 -t 200 -r 30000 --po
 
 ### TODO
 - [ ] Implement TTL (background thread scanning the database) or database scanning (possible with lmdbx cursors).
+- [ ] Reduce per-request flume channel allocations
 
-### FIXME
-- Building this project currently requires an augmented version of [libmdbx-rs](https://github.com/vorot93/libmdbx-rs).
-  - [ ] fork libmdbx-rs, add support for running write transactions in the current thread (without a hidden one, provided by the library).
-  - [ ] contribute changes back
+### Research
+- [ ] rework this to use thread per core design with io_uring support, using something like [Glommio](https://github.com/DataDog/glommio)
