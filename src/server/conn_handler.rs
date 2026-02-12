@@ -22,7 +22,9 @@ pub struct ConnectionHandler {
     pub peer_addr: SocketAddr,
 
     pub shutdown_rx: watch::Receiver<bool>,
-    pub db_channel_tx: flume::Sender<DBRequest>,
+    pub db_request_tx: flume::Sender<DBRequest>,
+    pub db_response_tx: flume::Sender<DBResponse>,
+    pub db_response_rx: flume::Receiver<DBResponse>,
 }
 
 macro_rules! CH_stats_add {
@@ -134,16 +136,15 @@ impl ConnectionHandler {
                     }
                 };
 
-                let (tx, rx) = flume::bounded::<DBResponse>(1);
                 let msg = DBRequest {
                     msg: DBMessage::Get {
                         // this is safe because we wait for response, keeping the str buffer alive
                         key: unsafe { std::mem::transmute::<&str, &'static str>(key) },
                     },
-                    reply: tx,
+                    reply: self.db_response_tx.clone(),
                 };
 
-                match self.db_channel_tx.send(msg) {
+                match self.db_request_tx.send(msg) {
                     Ok(_) => {}
                     Err(_e) => {
                         // The only option is "all receivers have dropped" as per flume's code,
@@ -154,7 +155,7 @@ impl ConnectionHandler {
                     }
                 };
 
-                match rx.recv_async().await {
+                match self.db_response_rx.recv_async().await {
                     Ok(DBResponse::Get { data }) => match data {
                         Some(mut buf) => {
                             CH_stats_add!(self, requests.get_hit, 1);
@@ -235,16 +236,15 @@ impl ConnectionHandler {
                 {
                     CH_stats_add!(self, requests.set, 1);
 
-                    let (tx, rx) = flume::bounded::<DBResponse>(1);
                     let msg = DBRequest {
                         msg: DBMessage::Set {
                             key: unsafe { std::mem::transmute::<&str, &'static str>(key) },
                             data: data_buf.freeze(),
                         },
-                        reply: tx,
+                        reply: self.db_response_tx.clone(),
                     };
 
-                    match self.db_channel_tx.send(msg) {
+                    match self.db_request_tx.send(msg) {
                         Ok(_) => {}
                         Err(_e) => {
                             self.socket.write_all("ERROR: shutting down\r\n".as_bytes()).await?;
@@ -252,7 +252,7 @@ impl ConnectionHandler {
                         }
                     };
 
-                    match rx.recv_async().await {
+                    match self.db_response_rx.recv_async().await {
                         Ok(_) => {
                             self.socket.write_all("STORED\r\n".as_bytes()).await?;
                         }

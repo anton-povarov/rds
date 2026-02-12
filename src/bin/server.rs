@@ -75,12 +75,15 @@ async fn server_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     },
                     Ok((socket, peer_addr)) => {
+                        let (db_response_tx, db_response_rx) = flume::bounded(1);
                         let mut conn_handler = ConnectionHandler {
                             stats: Arc::clone(&stats),
                             socket: socket,
                             peer_addr: peer_addr,
                             shutdown_rx: shutdown_rx.clone(),
-                            db_channel_tx: db_engine.get_worker_channel(),
+                            db_request_tx: db_engine.get_worker_channel(),
+                            db_response_tx: db_response_tx,
+                            db_response_rx: db_response_rx,
                         };
                         tokio::spawn(async move {
                             conn_handler.stats.n_connections.fetch_add(1, atomic::Ordering::Relaxed);
