@@ -65,13 +65,13 @@ impl DBEngine {
         self.workers.into_iter().for_each(|w| {
             let id = w.id;
             if let Err(e) = w.join() {
-                println!("error joining db_worker[{}]: {:?}", id, e);
+                println!("error joining db_worker/{}: {:?}", id, e);
             };
         });
 
         _ = self.saver_shutdown_tx.send(true);
         if let Err(e) = self.saver.thr.join() {
-            println!("error joining db_saver: {:?}", e);
+            println!("error joining db_syncer: {:?}", e);
         }
     }
 
@@ -93,40 +93,44 @@ impl DBSyncThread {
         let (tx, rx) //:
             = flume::bounded::<DBSyncMessage>(Self::SYNC_THREAD_CHANNEL_BUFFER_SZ);
 
-        let thr = std::thread::spawn(move || {
-            println!("db_sync: started");
+        let thr = std::thread::Builder::new()
+            .name("db_syncer".to_string())
+            .spawn(move || {
+                println!("db_syncer: starting");
 
-            let should_shutdown = Cell::new(false);
-            while !should_shutdown.get() {
-                flume::Selector::new()
-                    .recv(&shutdown_rx, |_| {
-                        should_shutdown.set(true);
-                    })
-                    .recv(&rx, |msg_or_err| {
-                        let msg = match msg_or_err {
-                            Ok(x) => x,
-                            Err(_) => {
-                                should_shutdown.set(true);
-                                return;
+                let should_shutdown = Cell::new(false);
+                while !should_shutdown.get() {
+                    flume::Selector::new()
+                        .recv(&shutdown_rx, |_| {
+                            should_shutdown.set(true);
+                        })
+                        .recv(&rx, |msg_or_err| {
+                            let msg = match msg_or_err {
+                                Ok(x) => x,
+                                Err(_) => {
+                                    should_shutdown.set(true);
+                                    return;
+                                }
+                            };
+
+                            let tx = db.db.begin_rw_txn().expect("RW transaction start failed");
+                            let table = tx.open_table(None).unwrap();
+
+                            for (k, v) in msg.data.into_iter() {
+                                tx.put(&table, k.as_bytes(), v, libmdbx::WriteFlags::UPSERT)
+                                    .unwrap();
                             }
-                        };
 
-                        let tx = db.db.begin_rw_txn().expect("RW transaction start failed");
-                        let table = tx.open_table(None).unwrap();
+                            _ = tx.commit().inspect_err(|e| {
+                                println!("db_syncer: THIS IS BAD, sync err: {}", e);
+                            });
+                        })
+                        .wait();
+                }
 
-                        for (k, v) in msg.data.into_iter() {
-                            tx.put(&table, k.as_bytes(), v, libmdbx::WriteFlags::UPSERT).unwrap();
-                        }
-
-                        _ = tx.commit().inspect_err(|e| {
-                            println!("db_sync: THIS IS BAD, sync err: {}", e);
-                        });
-                    })
-                    .wait();
-            }
-
-            println!("db_sync: exiting");
-        });
+                println!("db_syncer: exiting");
+            })
+            .expect("failed to spawn db_syncer thread");
         DBSyncThread {
             input_tx: tx,
             thr: thr,
@@ -170,62 +174,64 @@ impl DBWorkerThread {
     ) -> DBWorkerThread {
         let (db_writer_tx, db_writer_rx) = flume::bounded::<DBRequest>(Self::CHANNEL_BUFFER_SZ);
 
-        let thr = std::thread::spawn({
-            move || {
-                println!("db_saver[{}]: starting", id);
+        let thr = std::thread::Builder::new()
+            .name(format!("db_worker/{}", id))
+            .spawn({
+                move || {
+                    println!("db_worker/{}: starting", id);
 
-                // permaopen the table we'll need for all transactions ![in this thread]
-                let db_table = {
-                    let tx = db.db.begin_ro_txn().unwrap();
-                    let table = tx.open_table(None).unwrap();
-                    tx.prime_for_permaopen(table);
-                    let (_, tvec) = tx.commit_and_rebind_open_dbs().unwrap();
-                    tvec.into_iter().next().unwrap()
-                };
+                    // permaopen the table we'll need for all transactions ![in this thread]
+                    let db_table = {
+                        let tx = db.db.begin_ro_txn().unwrap();
+                        let table = tx.open_table(None).unwrap();
+                        tx.prime_for_permaopen(table);
+                        let (_, tvec) = tx.commit_and_rebind_open_dbs().unwrap();
+                        tvec.into_iter().next().unwrap()
+                    };
 
-                let mut ctx = DBThreadContext {
-                    id: id,
-                    db: &db,
-                    db_table: db_table,
-                    transaction: None,
-                    write_cache: HashMap::with_capacity(Self::WRITE_CACHE_INITIAL_SIZE),
-                    read_cache: HashMap::with_capacity(Self::READ_CACHE_INITIAL_SIZE),
-                    syncer_tx: syncer_tx,
-                };
+                    let mut ctx = DBThreadContext {
+                        id: id,
+                        db: &db,
+                        db_table: db_table,
+                        transaction: None,
+                        write_cache: HashMap::with_capacity(Self::WRITE_CACHE_INITIAL_SIZE),
+                        read_cache: HashMap::with_capacity(Self::READ_CACHE_INITIAL_SIZE),
+                        syncer_tx: syncer_tx,
+                    };
 
-                let mut next_tick = std::time::Instant::now();
+                    let mut next_tick = std::time::Instant::now();
 
-                println!("db_saver[{}]: infinite loop begin", id);
-                loop {
-                    if let Ok(_) = shutdown_rx.try_recv() {
-                        break;
-                    }
-
-                    match db_writer_rx.recv_deadline(next_tick) {
-                        Ok(msg) => {
-                            let handle_r = { Self::handle_message(&mut ctx, msg.msg) };
-                            match handle_r {
-                                Ok(r) => msg.reply.send(r).unwrap(), // sender is expected to wait for result
-                                Err(e) => eprintln!("db_saver[{}]: db error: {:?}", id, e),
-                            }
-                        }
-                        Err(flume::RecvTimeoutError::Timeout) => {
-                            next_tick += std::time::Duration::from_millis(1_000);
-
-                            let handle_r = { Self::commit_outstanding_writes(&mut ctx) };
-                            match handle_r {
-                                Ok(_) => {}
-                                Err(e) => eprintln!("db_saver[{}]: db error: {:?}", id, e),
-                            }
-                        }
-                        Err(flume::RecvTimeoutError::Disconnected) => {
+                    loop {
+                        if let Ok(_) = shutdown_rx.try_recv() {
                             break;
                         }
+
+                        match db_writer_rx.recv_deadline(next_tick) {
+                            Ok(msg) => {
+                                let handle_r = { Self::handle_message(&mut ctx, msg.msg) };
+                                match handle_r {
+                                    Ok(r) => msg.reply.send(r).unwrap(), // sender is expected to wait for result
+                                    Err(e) => eprintln!("db_worker/{}: db error: {:?}", id, e),
+                                }
+                            }
+                            Err(flume::RecvTimeoutError::Timeout) => {
+                                next_tick += std::time::Duration::from_millis(1_000);
+
+                                let handle_r = { Self::commit_outstanding_writes(&mut ctx) };
+                                match handle_r {
+                                    Ok(_) => {}
+                                    Err(e) => eprintln!("db_worker/{}: db error: {:?}", id, e),
+                                }
+                            }
+                            Err(flume::RecvTimeoutError::Disconnected) => {
+                                break;
+                            }
+                        }
                     }
+                    println!("db_worker/{}: exiting", id);
                 }
-                println!("db_saver[{}]: exiting", id);
-            }
-        });
+            })
+            .expect("failed to spawn db_worker thread");
 
         DBWorkerThread {
             id: id,
