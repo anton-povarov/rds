@@ -140,7 +140,7 @@ async fn client_connection(conn_id: usize, ctx: Arc<SharedContext>) -> Result<()
         let mut i = 0;
         while i < args.n_requests {
             let mut j = i;
-            while j < (i + GET_BATCH_SIZE) && i < args.n_requests {
+            while j < (i + GET_BATCH_SIZE) && j < args.n_requests {
                 connection
                     .write_all(
                         format!(
@@ -190,6 +190,7 @@ async fn read_drain_connection(sock: &mut TcpStream) -> Result<(), io::Error> {
     let mut rdbuf = [0u8; 64 * 1024];
     loop {
         match sock.try_read(&mut rdbuf) {
+            Ok(0) => return Err(io::ErrorKind::ConnectionReset.into()),
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e),
