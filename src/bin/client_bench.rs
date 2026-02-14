@@ -6,7 +6,11 @@ use std::time::Duration;
 
 use clap::{self, Parser};
 use memchr::memchr;
-use rand::{self, Rng, distr::Alphanumeric, seq::SliceRandom};
+use rand::{
+    self, Rng,
+    distr::{Alphanumeric, SampleString},
+    seq::SliceRandom,
+};
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{
@@ -38,6 +42,9 @@ struct Args {
 
     #[arg(short = 'r', long = "requests", default_value = "100")]
     n_requests: usize,
+
+    #[arg(long = "datalen", default_value = "10")]
+    data_len: usize,
 }
 
 #[tokio::main]
@@ -142,7 +149,10 @@ async fn client_connection(conn_id: usize, ctx: Arc<SharedContext>) -> Result<()
         let started = time::Instant::now();
         println!("task {}; set()-ing slice {:?}", conn_id, (set_begin..set_end));
 
-        send_set_requests(&mut write_half, &ctx.all_keys, set_begin, set_end).await?;
+        let data = rand::distr::Alphanumeric.sample_string(&mut rand::rng(), args.data_len);
+
+        send_set_requests(&mut write_half, &ctx.all_keys, set_begin, set_end, data.as_bytes())
+            .await?;
         wait_for_responses(&read_progress, set_count).await?;
 
         if wait_barrier(&ctx.barrier).await?.is_leader() {
@@ -182,17 +192,18 @@ async fn send_set_requests(
     all_keys: &[String],
     begin: usize,
     end: usize,
+    data: &[u8],
 ) -> Result<(), io::Error> {
-    const SET_BATCH_SIZE: usize = 128;
-    let data = b"test \tdata\t";
+    const SET_MAX_BUFFER: usize = 128 * 1024;
+    let set_batch_size = (SET_MAX_BUFFER / data.len()).max(1);
     let data_len_ascii = data.len().to_string();
-    let mut write_buf = Vec::with_capacity(SET_BATCH_SIZE * 192);
+    let mut write_buf = Vec::with_capacity(SET_MAX_BUFFER);
 
     let mut i = begin;
     while i < end {
         write_buf.clear();
         let mut j = i;
-        while j < (i + SET_BATCH_SIZE) && j < end {
+        while j < (i + set_batch_size) && j < end {
             write_buf.extend_from_slice(b"set ");
             write_buf.extend_from_slice(all_keys[j].as_bytes());
             write_buf.push(b' ');
