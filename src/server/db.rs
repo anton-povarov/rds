@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use flume;
+use lru::LruCache;
 use rand::seq::IndexedRandom;
 use std::{borrow::Cow, cell::Cell, collections::HashMap, sync::Arc, thread::JoinHandle};
 
@@ -29,6 +30,60 @@ pub enum DBResponse {
 
 struct DBSyncMessage {
     data: HashMap<Arc<str>, Bytes>,
+}
+
+struct ReadCache {
+    entries: LruCache<Arc<str>, Option<Bytes>>,
+    used_bytes: usize,
+    max_bytes: usize,
+}
+
+impl ReadCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::unbounded(),
+            used_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Option<Bytes>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: Arc<str>, value: Option<Bytes>) {
+        if let Some(old) = self.entries.pop(key.as_ref()) {
+            self.used_bytes =
+                self.used_bytes.saturating_sub(Self::entry_charge(key.as_ref(), &old));
+        }
+
+        let charge = Self::entry_charge(key.as_ref(), &value);
+        if charge > self.max_bytes {
+            return;
+        }
+
+        self.entries.push(key, value);
+        self.used_bytes = self.used_bytes.saturating_add(charge);
+
+        while self.used_bytes > self.max_bytes {
+            let Some((evict_key, evict_value)) = self.entries.pop_lru() else {
+                self.used_bytes = 0;
+                break;
+            };
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(Self::entry_charge(evict_key.as_ref(), &evict_value));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.used_bytes = 0;
+    }
+
+    fn entry_charge(key: &str, value: &Option<Bytes>) -> usize {
+        key.len() + value.as_ref().map_or(0, |v| v.len())
+    }
 }
 
 pub struct DBEngine {
@@ -113,17 +168,35 @@ impl DBSyncThread {
                                 }
                             };
 
-                            let tx = db.db.begin_rw_txn().expect("RW transaction start failed");
-                            let table = tx.open_table(None).unwrap();
+                            const MAX_TRANSACTION_ITEMS: usize = 16 * 1024;
+                            const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 
+                            let mut tx = db.db.begin_rw_txn().expect("RW transaction start failed");
+                            let mut table = tx.open_table(None).unwrap();
+
+                            let mut tx_items: usize = 0;
+                            let mut tx_bytes: usize = 0;
                             for (k, v) in msg.data.into_iter() {
+                                let record_size = k.len() + v.len();
+
                                 tx.put(&table, k.as_bytes(), v, libmdbx::WriteFlags::UPSERT)
                                     .unwrap();
-                            }
 
-                            _ = tx.commit().inspect_err(|e| {
-                                println!("db_syncer: THIS IS BAD, sync err: {}", e);
-                            });
+                                tx_items += 1;
+                                tx_bytes += record_size + 128 /* assumed overhead */;
+
+                                if tx_items >= MAX_TRANSACTION_ITEMS
+                                    || tx_bytes >= MAX_TRANSACTION_BYTES
+                                {
+                                    _ = tx.commit().expect("db_syncer: transaction commit failed");
+                                    tx = db.db.begin_rw_txn().expect("RW transaction start failed");
+                                    table = tx.open_table(None).unwrap();
+
+                                    tx_items = 0;
+                                    tx_bytes = 0;
+                                }
+                            }
+                            _ = tx.commit().expect("db_syncer: transaction commit failed");
                         })
                         .wait();
                 }
@@ -155,7 +228,7 @@ struct DBThreadContext<'db> {
     db_table: libmdbx::Table<'db>,
     transaction: Option<lmdbx::TransactionRO<'db>>,
     write_cache: HashMap<Arc<str>, Bytes>, // sent to syncer thread periodically
-    read_cache: HashMap<Arc<str>, Option<Bytes>>, // negative & positive cache
+    read_cache: ReadCache,
     syncer_tx: flume::Sender<DBSyncMessage>,
 }
 
@@ -163,8 +236,8 @@ impl DBWorkerThread {
     const CHANNEL_BUFFER_SZ: usize = 128;
     const WRITE_CACHE_INITIAL_SIZE: usize = 16 * 1024;
     const WRITE_CACHE_HIGH_WATERMARK: usize = 14 * 1024; // send before the first rehash
-    const READ_CACHE_INITIAL_SIZE: usize = 16 * 1024;
-    const READ_CACHE_HIGH_WATERMARK: usize = 14 * 1024; // clear before the first rehash
+    const READ_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+    const WORKER_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 
     pub fn spawn(
         id: u32,
@@ -195,11 +268,11 @@ impl DBWorkerThread {
                         db_table: db_table,
                         transaction: None,
                         write_cache: HashMap::with_capacity(Self::WRITE_CACHE_INITIAL_SIZE),
-                        read_cache: HashMap::with_capacity(Self::READ_CACHE_INITIAL_SIZE),
+                        read_cache: ReadCache::new(Self::READ_CACHE_MAX_BYTES),
                         syncer_tx: syncer_tx,
                     };
 
-                    let mut next_tick = std::time::Instant::now();
+                    let mut next_tick = std::time::Instant::now() + Self::WORKER_TICK_INTERVAL;
 
                     loop {
                         if let Ok(_) = shutdown_rx.try_recv() {
@@ -215,9 +288,9 @@ impl DBWorkerThread {
                                 }
                             }
                             Err(flume::RecvTimeoutError::Timeout) => {
-                                next_tick += std::time::Duration::from_millis(1_000);
+                                next_tick += Self::WORKER_TICK_INTERVAL;
 
-                                let handle_r = { Self::commit_outstanding_writes(&mut ctx) };
+                                let handle_r = { Self::tick_maintenance(&mut ctx) };
                                 match handle_r {
                                     Ok(_) => {}
                                     Err(e) => eprintln!("db_worker/{}: db error: {:?}", id, e),
@@ -254,9 +327,7 @@ impl DBWorkerThread {
 
                 match ctx.read_cache.get(key) {
                     Some(Some(b)) => {
-                        return Ok(DBResponse::Get {
-                            data: Some(b.clone()),
-                        });
+                        return Ok(DBResponse::Get { data: Some(b) });
                     }
                     Some(None) => return Ok(DBResponse::Get { data: None }),
                     None => {}
@@ -265,7 +336,7 @@ impl DBWorkerThread {
                 // create the read transaction if it doesn't yet exist
                 if ctx.transaction.is_none() {
                     let tx: lmdbx::TransactionRO =
-                        ctx.db.db.begin_ro_txn().expect("transaction start failed");
+                        ctx.db.db.begin_ro_txn().expect("RO transaction start failed");
                     ctx.transaction = Some(tx);
                 }
                 let tx = ctx.transaction.as_ref().unwrap();
@@ -292,7 +363,7 @@ impl DBWorkerThread {
 
                 ctx.write_cache.insert(Arc::clone(&rc_key), data.clone());
                 if ctx.write_cache.len() > Self::WRITE_CACHE_HIGH_WATERMARK {
-                    Self::commit_outstanding_writes(ctx)?;
+                    Self::commit_outstanding_writes(ctx);
                 }
 
                 Ok(DBResponse::Set { ok: true })
@@ -300,35 +371,20 @@ impl DBWorkerThread {
         }
     }
 
-    fn commit_outstanding_writes(
-        ctx: &mut DBThreadContext,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn commit_outstanding_writes(ctx: &mut DBThreadContext) {
         if !ctx.write_cache.is_empty() {
-            //
-            // NOTE(antoxa): not needed anymore, since we only have read trx-s here, keeping for posteriority
-            //
-            // we must avoid overlapping read and read-write transactions in the same thread
-            // Results in error from libmdbx MDBX_TXN_OVERLAPPING = -30415
-            // can just drop the read transaction and let it be auto-reopened on next incoming message
-            // if ctx.ro_transaction.is_some() {
-            //     let tx = ctx.ro_transaction.take();
-            //     drop(tx);
-            // }
-
-            // send the whole write cache to the syncer thread, replacing it locally with an empty cache
             let send_wcache = std::mem::replace(
                 &mut ctx.write_cache,
                 HashMap::with_capacity(Self::WRITE_CACHE_INITIAL_SIZE),
             );
             ctx.syncer_tx.send(DBSyncMessage { data: send_wcache }).unwrap();
         }
+    }
 
-        // FIXME: this should not be here, read_cache lifecycle
-        //  should be independent from the write_cache lifecycle
-        if ctx.read_cache.len() > Self::READ_CACHE_HIGH_WATERMARK {
-            ctx.read_cache.clear();
-        }
-
+    fn tick_maintenance(ctx: &mut DBThreadContext) -> Result<(), Box<dyn std::error::Error>> {
+        Self::commit_outstanding_writes(ctx);
+        _ = ctx.transaction.take(); // reset curr transaction, it will get reopened on 1st request
+        ctx.read_cache.clear(); // also clear cache to avoid extra staleness
         Ok(())
     }
 
